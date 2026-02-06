@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>实时量化看板</title>
+    <link rel="stylesheet" href="/static/style.css?v=20260205_2" />
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="header">
+        <div>
+          <div class="title">实时量化看板</div>
+          <div class="subtitle">WebSocket 实时推送：价格 / 指标 / 信号 / 纸上交易</div>
+        </div>
+        <div class="status">
+          <span id="wsStatus" class="pill pill-warn">未连接</span>
+          <span id="activeSymbol" class="pill">-</span>
+          <span id="msgCount" class="pill mono">0</span>
+          <span id="lastUpdate" class="pill mono">--:--:--</span>
+          <span id="jsStatus" class="pill">脚本:?</span>
+          <span id="pollCount" class="pill mono">轮询:0</span>
+        </div>
+      </header>
+
+      <main class="grid">
+        <section class="card">
+          <div class="card-title">价格曲线</div>
+          <canvas id="priceChart" height="140"></canvas>
+        </section>
+
+        <section class="card">
+          <div class="card-title">最新信号</div>
+          <div class="kv">
+            <div class="k">标的</div><div class="v" id="sym">-</div>
+            <div class="k">价格</div><div class="v" id="price">-</div>
+            <div class="k">信号</div><div class="v" id="signal">-</div>
+            <div class="k">原因</div><div class="v" id="reason">-</div>
+            <div class="k">均线(短)</div><div class="v" id="maS">-</div>
+            <div class="k">均线(长)</div><div class="v" id="maL">-</div>
+            <div class="k">RSI</div><div class="v" id="rsi">-</div>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="card-title">纸上交易账户</div>
+          <div class="kv">
+            <div class="k">现金</div><div class="v" id="cash">-</div>
+            <div class="k">总资产</div><div class="v" id="equity">-</div>
+            <div class="k">最新订单</div><div class="v mono" id="lastOrder">-</div>
+          </div>
+          <div class="table-title">持仓</div>
+          <table class="table" id="posTable">
+            <thead>
+              <tr><th>标的</th><th>数量</th><th>均价</th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </section>
+
+        <section class="card">
+          <div class="card-title">说明</div>
+          <div class="text">
+            <p>
+              后端会每 <span class="mono">interval_seconds</span> 推一次 tick。
+              你可以在 <span class="mono">config/config.yaml</span> 里改 symbols / 策略参数。
+            </p>
+            <p>
+              当前 UI 默认展示“最后收到的 symbol”。如果你想做多标的切换/对比，我可以继续加。
+            </p>
+            <p class="mono" id="debugLine">debug: -</p>
+            <p class="mono" id="debugLine2">debug2: -</p>
+          </div>
+        </section>
+
+        <section class="card log-card">
+          <div class="card-title">运行日志</div>
+          <div class="log-toolbar">
+            <button id="btnClearLog" class="btn">清空</button>
+            <span class="muted">（自动追加，最多保留 300 行）</span>
+          </div>
+          <pre id="logBox" class="log-box"></pre>
+        </section>
+      </main>
+    </div>
+
+    <script src="/static/app.js?v=20260205_2"></script>
+  </body>
+</html>
+

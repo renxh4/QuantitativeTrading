@@ -1,0 +1,25 @@
+app:
+  interval_seconds: 1.0
+  # 支持格式:
+  # - "600000.SH" / "000001.SZ"
+  # - "sh600000" / "sz000001"
+  # - "600000" / "000001" (自动推断 6xxxxx -> SH, 其他 -> SZ)
+  symbols: ["600519.SH", "000001.SZ"]
+
+provider:
+  type: eastmoney
+  eastmoney:
+    base_url: "https://push2.eastmoney.com"
+    timeout_seconds: 5.0
+    proxy: null
+
+strategy:
+  type: ma_crossover
+  ma_crossover:
+    short_window: 10
+    long_window: 30
+
+broker:
+  starting_cash: 100000
+  order_size: 100
+

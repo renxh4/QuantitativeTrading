@@ -1,0 +1,30 @@
+app:
+  interval_seconds: 1.0
+  symbols: ["AAPL", "MSFT"]
+
+provider:
+  type: simulated
+  simulated:
+    start_price: 180.0
+    drift: 0.0001
+    volatility: 0.01
+    seed: 42
+  eastmoney:
+    base_url: "https://push2.eastmoney.com"
+    timeout_seconds: 5.0
+    proxy: null
+
+strategy:
+  type: ma_crossover
+  ma_crossover:
+    short_window: 10
+    long_window: 30
+  rsi:
+    period: 14
+    buy_below: 30
+    sell_above: 70
+
+broker:
+  starting_cash: 100000
+  order_size: 10
+
