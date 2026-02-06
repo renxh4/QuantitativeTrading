@@ -63,6 +63,62 @@ def show_alert(title: str, message: str) -> None:
         return
 
 
+def prompt_choice(title: str, message: str, *, yes_text: str, no_text: str, default_yes: bool = False) -> bool:
+    """
+    弹窗让用户做选择，并返回 True/False。
+    - True: 选择 yes_text（例如“买入/卖出”）
+    - False: 选择 no_text（例如“不买/不卖”）
+    尽量使用系统弹窗；如果系统不支持则回退到终端输入。
+    """
+    sysname = platform.system()
+
+    # macOS: AppleScript dialog with buttons
+    if sysname == "Darwin":
+        # Return format: "button returned:买入"
+        default_btn = yes_text if default_yes else no_text
+        script = (
+            f'display dialog "{message}" with title "{title}" '
+            f'buttons {{"{no_text}","{yes_text}"}} default button "{default_btn}"'
+        )
+        try:
+            p = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, check=False)
+            out = (p.stdout or "").strip()
+            if f"button returned:{yes_text}" in out:
+                return True
+            if f"button returned:{no_text}" in out:
+                return False
+            # user canceled -> treat as NO
+            return False
+        except Exception:
+            return False
+
+    # Windows: MessageBox Yes/No
+    if sysname == "Windows":
+        try:
+            import ctypes  # noqa: PLC0415
+
+            MB_YESNO = 0x04
+            MB_ICONQUESTION = 0x20
+            IDYES = 6
+            r = ctypes.windll.user32.MessageBoxW(0, message, title, MB_YESNO | MB_ICONQUESTION)
+            return bool(r == IDYES)
+        except Exception:
+            return False
+
+    # Linux/others: best effort in terminal
+    try:
+        ans = input(f"{title}: {message} [{yes_text}/{no_text}] (默认{'是' if default_yes else '否'}): ").strip()
+        if not ans:
+            return default_yes
+        if ans in {yes_text, "y", "Y", "yes", "YES", "是"}:
+            return True
+        if ans in {no_text, "n", "N", "no", "NO", "否"}:
+            return False
+    except Exception:
+        pass
+    return default_yes
+
+
 def call_with_retries(
     action_name: str,
     fn: Callable[..., Any],
@@ -435,6 +491,26 @@ def get_today_open_price(code: str) -> Optional[float]:
     return _to_float(df.iloc[0].get("开盘"))
 
 
+@dataclass
+class TradeConfig:
+    position_cash: float = 10000.0  # 每次买入投入 1 万
+    commission_rate: float = 0.0003  # 佣金万3
+    min_commission: float = 5.0  # 最低 5 元
+    stamp_duty: float = 0.0005  # 印花税万5（仅卖出）
+    lot_size: int = 100  # A 股一手=100股
+
+
+def calculate_fee(cfg: TradeConfig, amount: float, *, is_selling: bool) -> float:
+    """
+    手续费模型：
+    - 佣金：万3，最低5元（买卖都收）
+    - 印花税：万5（仅卖出收）
+    """
+    comm = max(float(amount) * float(cfg.commission_rate), float(cfg.min_commission))
+    duty = float(amount) * float(cfg.stamp_duty) if is_selling else 0.0
+    return float(comm + duty)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--symbol", default="000630", help="股票代码，默认 000630")
@@ -445,6 +521,7 @@ def main() -> None:
     ap.add_argument("--max-loops", type=int, default=0, help="最多循环次数（0=无限），方便测试")
     ap.add_argument("--ignore-trading-hours", action="store_true", help="忽略交易时段限制（方便测试）")
     ap.add_argument("--alert-cooldown", type=int, default=60, help="触发信号弹窗冷却秒数，默认 60")
+    ap.add_argument("--position-cash", type=float, default=10000.0, help="每次买入投入金额（元），默认 10000")
     args = ap.parse_args()
 
     symbol = args.symbol
@@ -452,18 +529,32 @@ def main() -> None:
     buy_line = float(args.buy_line)
     sell_line = float(args.sell_line)
     check_interval = int(args.check_interval)
+    tcfg = TradeConfig(position_cash=float(args.position_cash))
 
     print(colored(f"--- 铜陵有色({symbol}) 实战做T监控器启动 ---", "cyan"))
-    print(f"刷新间隔: {check_interval}s | 非交易时段：自动回放最近交易日数据并自动设置基准价=昨日开盘价")
+    print(
+        f"刷新间隔: {check_interval}s | 每次买入投入: {tcfg.position_cash:.0f}元 | "
+        f"费用: 佣金万3(最低5元) + 卖出印花税万5 | "
+        "非交易时段：自动回放最近交易日数据并自动设置基准价=昨日开盘价"
+    )
 
     loops = 0
     mode: Literal["REALTIME", "REPLAY"] = "REALTIME"
     replay: Optional[ReplayState] = None
     base_price: float = base_price_input
     base_price_day: Optional[str] = None  # YYYY-MM-DD; used in REALTIME mode
+    in_position: bool = False
+    buy_price: Optional[float] = None
+    buy_mode: Optional[str] = None  # REALTIME/REPLAY
+    buy_time: Optional[str] = None
+    buy_shares: int = 0
+    buy_amount: float = 0.0
+    buy_fee: float = 0.0
     last_alert_at: float = 0.0
     last_signal: Optional[str] = None  # BUY/SELL/None
     next_replay_init_at: float = 0.0
+    defer_buy_prompt: bool = False
+    defer_sell_prompt: bool = False
 
     while True:
         loops += 1
@@ -485,6 +576,14 @@ def main() -> None:
                     replay = ReplayState(trade_date=actual_date, df=df_y, source=src, idx=0)
                     base_price = replay.base_open()  # 2) 自动替换基准价=昨日开盘价
                     mode = "REPLAY"
+                    # 回放/实时切换时，清空“买入价状态”，避免跨模式混淆
+                    in_position = False
+                    buy_price = None
+                    buy_mode = None
+                    buy_time = None
+                    buy_shares = 0
+                    buy_amount = 0.0
+                    buy_fee = 0.0
                     if actual_date != td:
                         print(colored(f"[{now.strftime('%H:%M:%S')}] 昨日({td})数据不可用，已回退到 {actual_date}（来源={src}），基准价自动设置为 {base_price:.3f}", "yellow"))
                     else:
@@ -502,6 +601,15 @@ def main() -> None:
                 if current_price is not None:
                     change = (current_price - base_price) / base_price
                     status = f"[{tstr}] (回放{replay.trade_date} | 数据源={replay.source}) 当前价: {current_price:.3f} | 相对基准涨跌: {change:.2%}"
+                    if in_position and buy_price:
+                        pnl = (current_price - buy_price) / buy_price
+                        # 预计此价卖出盈亏（含费用）
+                        sell_amount = float(buy_shares) * float(current_price)
+                        sell_fee = calculate_fee(tcfg, sell_amount, is_selling=True)
+                        est_profit = sell_amount - buy_amount - buy_fee - sell_fee
+                        status += f" | 相对买入涨跌: {pnl:.2%} | 若此价卖出预计盈亏(含费用): {est_profit:+.2f}元"
+                    else:
+                        status += " | 相对买入涨跌: N/A"
                     if amount is not None:
                         status += f" | 当日累计成交额: {(amount / 1e8):.2f}亿"
                     # 信号判断
@@ -514,6 +622,64 @@ def main() -> None:
                         print(colored(f"$$$ [卖出信号] $$$ {status} - 利润达标，准备反手出仓！", "green", attrs=["bold"]))
                     else:
                         print(status + " | 监控中...")
+
+                    # 避免“拒绝后每次循环都弹窗”：只有信号消失后才允许再次弹窗
+                    if signal != "BUY":
+                        defer_buy_prompt = False
+                    if signal != "SELL":
+                        defer_sell_prompt = False
+
+                    # 交互式决策：买 / 不买
+                    if signal == "BUY" and (not in_position) and (not defer_buy_prompt):
+                        ok = prompt_choice("买入决策", status + "\n\n是否执行买入？", yes_text="买入", no_text="不买", default_yes=False)
+                        defer_buy_prompt = True
+                        if ok:
+                            lot_cost = float(current_price) * float(tcfg.lot_size)
+                            shares = int((tcfg.position_cash // lot_cost) * tcfg.lot_size) if lot_cost > 0 else 0
+                            if shares <= 0:
+                                print(colored(f"[{tstr}] 选择买入，但投入{tcfg.position_cash:.0f}元不足以买入1手，跳过记录仓位。", "yellow"))
+                            else:
+                                in_position = True
+                                buy_price = float(current_price)
+                                buy_mode = "REPLAY"
+                                buy_time = tstr
+                                buy_shares = shares
+                                buy_amount = float(shares) * float(current_price)
+                                buy_fee = calculate_fee(tcfg, buy_amount, is_selling=False)
+                                print(
+                                    colored(
+                                        f"[{tstr}] 已买入(模拟)：买入价 {buy_price:.3f} | 股数 {buy_shares} | 买入额 {buy_amount:.2f} | 买入费用 {buy_fee:.2f}",
+                                        "red",
+                                        attrs=["bold"],
+                                    )
+                                )
+                        else:
+                            print(colored(f"[{tstr}] 选择不买，继续观察。", "yellow"))
+
+                    # 交互式决策：卖 / 不卖
+                    if signal == "SELL" and in_position and (not defer_sell_prompt):
+                        ok = prompt_choice("卖出决策", status + "\n\n是否执行卖出？", yes_text="卖出", no_text="不卖", default_yes=False)
+                        defer_sell_prompt = True
+                        if ok:
+                            sell_amount = float(buy_shares) * float(current_price)
+                            sell_fee = calculate_fee(tcfg, sell_amount, is_selling=True)
+                            profit = sell_amount - buy_amount - buy_fee - sell_fee
+                            print(
+                                colored(
+                                    f"[{tstr}] 已卖出(模拟)结算：卖出额 {sell_amount:.2f} | 卖出费用 {sell_fee:.2f} | 本次盈亏(含费用) {profit:+.2f}元",
+                                    "green",
+                                    attrs=["bold"],
+                                )
+                            )
+                            in_position = False
+                            buy_price = None
+                            buy_mode = None
+                            buy_time = None
+                            buy_shares = 0
+                            buy_amount = 0.0
+                            buy_fee = 0.0
+                        else:
+                            print(colored(f"[{tstr}] 选择不卖，继续持有观察。", "yellow"))
 
                     # 3) 触发警戒线弹窗（带冷却 + 同信号不重复刷屏）
                     if signal and (time.time() - last_alert_at >= int(args.alert_cooldown) or signal != last_signal):
@@ -530,6 +696,13 @@ def main() -> None:
                 replay = None
                 base_price = base_price_input
                 base_price_day = None
+                in_position = False
+                buy_price = None
+                buy_mode = None
+                buy_time = None
+                buy_shares = 0
+                buy_amount = 0.0
+                buy_fee = 0.0
                 print(colored(f"[{now.strftime('%H:%M:%S')}] 进入交易时段：切回实时模式，将自动设置基准价=当日开盘价（失败则使用输入值 {base_price_input:.3f}）", "cyan"))
 
             # 基准价：交易时段自动设置为当日开盘价（每天只设置一次）
@@ -559,6 +732,14 @@ def main() -> None:
             if current_price is not None:
                 change = (current_price - base_price) / base_price
                 status = f"[{now.strftime('%H:%M:%S')}] (实时 | 数据源={src}) 当前价: {current_price:.3f} | 相对基准涨跌: {change:.2%}"
+                if in_position and buy_price:
+                    pnl = (current_price - buy_price) / buy_price
+                    sell_amount = float(buy_shares) * float(current_price)
+                    sell_fee = calculate_fee(tcfg, sell_amount, is_selling=True)
+                    est_profit = sell_amount - buy_amount - buy_fee - sell_fee
+                    status += f" | 相对买入涨跌: {pnl:.2%} | 若此价卖出预计盈亏(含费用): {est_profit:+.2f}元"
+                else:
+                    status += " | 相对买入涨跌: N/A"
                 if amount is not None:
                     status += f" | 今日成交额(估算): {(amount / 1e8):.2f}亿"
 
@@ -571,6 +752,61 @@ def main() -> None:
                     print(colored(f"$$$ [卖出信号] $$$ {status} - 利润达标，准备反手出仓！", "green", attrs=["bold"]))
                 else:
                     print(status + " | 监控中...")
+
+                if signal != "BUY":
+                    defer_buy_prompt = False
+                if signal != "SELL":
+                    defer_sell_prompt = False
+
+                if signal == "BUY" and (not in_position) and (not defer_buy_prompt):
+                    ok = prompt_choice("买入决策", status + "\n\n是否执行买入？", yes_text="买入", no_text="不买", default_yes=False)
+                    defer_buy_prompt = True
+                    if ok:
+                        lot_cost = float(current_price) * float(tcfg.lot_size)
+                        shares = int((tcfg.position_cash // lot_cost) * tcfg.lot_size) if lot_cost > 0 else 0
+                        if shares <= 0:
+                            print(colored(f"[{now.strftime('%H:%M:%S')}] 选择买入，但投入{tcfg.position_cash:.0f}元不足以买入1手，跳过记录仓位。", "yellow"))
+                        else:
+                            in_position = True
+                            buy_price = float(current_price)
+                            buy_mode = "REALTIME"
+                            buy_time = now.strftime("%H:%M:%S")
+                            buy_shares = shares
+                            buy_amount = float(shares) * float(current_price)
+                            buy_fee = calculate_fee(tcfg, buy_amount, is_selling=False)
+                            print(
+                                colored(
+                                    f"[{buy_time}] 已买入(模拟)：买入价 {buy_price:.3f} | 股数 {buy_shares} | 买入额 {buy_amount:.2f} | 买入费用 {buy_fee:.2f}",
+                                    "red",
+                                    attrs=["bold"],
+                                )
+                            )
+                    else:
+                        print(colored(f"[{now.strftime('%H:%M:%S')}] 选择不买，继续观察。", "yellow"))
+
+                if signal == "SELL" and in_position and (not defer_sell_prompt):
+                    ok = prompt_choice("卖出决策", status + "\n\n是否执行卖出？", yes_text="卖出", no_text="不卖", default_yes=False)
+                    defer_sell_prompt = True
+                    if ok:
+                        sell_amount = float(buy_shares) * float(current_price)
+                        sell_fee = calculate_fee(tcfg, sell_amount, is_selling=True)
+                        profit = sell_amount - buy_amount - buy_fee - sell_fee
+                        print(
+                            colored(
+                                f"[{now.strftime('%H:%M:%S')}] 已卖出(模拟)结算：卖出额 {sell_amount:.2f} | 卖出费用 {sell_fee:.2f} | 本次盈亏(含费用) {profit:+.2f}元",
+                                "green",
+                                attrs=["bold"],
+                            )
+                        )
+                        in_position = False
+                        buy_price = None
+                        buy_mode = None
+                        buy_time = None
+                        buy_shares = 0
+                        buy_amount = 0.0
+                        buy_fee = 0.0
+                    else:
+                        print(colored(f"[{now.strftime('%H:%M:%S')}] 选择不卖，继续持有观察。", "yellow"))
 
                 if signal and (time.time() - last_alert_at >= int(args.alert_cooldown) or signal != last_signal):
                     show_alert("防范补跌风险" if signal == "BUY" else "止盈提醒", status)
