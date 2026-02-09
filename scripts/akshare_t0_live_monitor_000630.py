@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Optional, Callable, Literal
 
-import akshare as ak
 import httpx
 
 try:
@@ -33,34 +32,6 @@ def _to_float(x: Any) -> Optional[float]:
         return float(s)
     except ValueError:
         return None
-
-
-def show_alert(title: str, message: str) -> None:
-    """
-    Best-effort popup alert:
-    - macOS: osascript
-    - Windows: MessageBoxW
-    - Linux: notify-send (if available)
-    Always prints to stdout as fallback.
-    """
-    print(f"[弹窗] {title}: {message}")
-
-    sysname = platform.system()
-    try:
-        if sysname == "Darwin":
-            script = f'display alert "{title}" message "{message}" as critical'
-            subprocess.run(["osascript", "-e", script], check=False)
-            return
-        if sysname == "Windows":
-            import ctypes  # noqa: PLC0415
-
-            ctypes.windll.user32.MessageBoxW(0, message, title, 0x30)  # MB_ICONWARNING
-            return
-        if shutil.which("notify-send"):
-            subprocess.run(["notify-send", title, message], check=False)
-            return
-    except Exception:
-        return
 
 
 def prompt_choice(title: str, message: str, *, yes_text: str, no_text: str, default_yes: bool = False) -> bool:
@@ -217,25 +188,7 @@ class ReplayState:
 
 
 def _fetch_minute_df_for_date(code: str, trade_date: str):
-    start = f"{trade_date} 09:30:00"
-    end = f"{trade_date} 15:00:00"
-    df = call_with_retries(
-        "拉取单股分时行情(回放)",
-        ak.stock_zh_a_hist_min_em,
-        kwargs={
-            "symbol": str(code),
-            "start_date": start,
-            "end_date": end,
-            "period": "1",
-            "adjust": "",
-        },
-        max_retries=3,
-    )
-    if df is None or len(df) == 0:
-        raise RuntimeError("回放分时数据为空")
-    if "开盘" not in df.columns or "收盘" not in df.columns or "成交额" not in df.columns:
-        raise RuntimeError(f"回放数据缺少列: 开盘/收盘/成交额; 实际列名={list(df.columns)}")
-    return df
+    raise RuntimeError("已废弃：AkShare 已移除")
 
 
 def _cache_path(symbol: str, trade_date: str) -> str:
@@ -275,7 +228,7 @@ def _eastmoney_secid(code: str) -> str:
 
 def _fetch_minute_df_eastmoney(code: str, trade_date: str):
     """
-    东方财富分时 1分钟K 作为 AkShare 失败时的兜底（更稳）。
+    东方财富分时 1分钟K（免 token）。
     """
     import pandas as pd  # type: ignore
 
@@ -341,48 +294,19 @@ def _fetch_minute_df_eastmoney(code: str, trade_date: str):
 
 def fetch_replay_df(symbol: str, trade_date: str):
     """
-    取“昨日回放数据”，优先 AkShare，失败则使用本地缓存，再失败用东方财富兜底。
+    取“昨日回放数据”：
+    - 优先使用本地缓存
+    - 缓存缺失则用东方财富分钟K拉取并落盘缓存
     """
-    # 1) try akshare
-    try:
-        df = _fetch_minute_df_for_date(symbol, trade_date)
-        _save_cached_df(df, symbol, trade_date)
-        return df, "akshare", trade_date
-    except Exception:
-        pass
-
-    # 2) cache
+    # 1) cache
     dfc = _load_cached_df(symbol, trade_date)
     if dfc is not None and len(dfc) > 0:
         return dfc, "cache", trade_date
 
-    # 3) eastmoney fallback
+    # 2) eastmoney
     df2, actual_date = _fetch_minute_df_eastmoney(symbol, trade_date)
     _save_cached_df(df2, symbol, actual_date)
     return df2, "eastmoney", actual_date
-
-
-def _minute_df_akshare_today(code: str):
-    now = datetime.now()
-    start = now.strftime("%Y-%m-%d 09:30:00")
-    end = now.strftime("%Y-%m-%d %H:%M:%S")
-    df = call_with_retries(
-        "拉取单股分时行情(实时/AkShare)",
-        ak.stock_zh_a_hist_min_em,
-        kwargs={
-            "symbol": str(code),
-            "start_date": start,
-            "end_date": end,
-            "period": "1",
-            "adjust": "",
-        },
-        max_retries=2,
-        base_delay=1.0,
-        max_delay=6.0,
-    )
-    if df is None or len(df) == 0:
-        raise RuntimeError("实时分时数据为空(AkShare)")
-    return df
 
 
 def _minute_df_eastmoney_today(code: str):
@@ -391,102 +315,101 @@ def _minute_df_eastmoney_today(code: str):
     return df, actual_date
 
 
+def _eastmoney_quote(code: str) -> dict[str, Any]:
+    """
+    东方财富 push2 实时报价（免 token）
+    """
+    secid = _eastmoney_secid(code)
+    params = {
+        "secid": secid,
+        # f43 最新价, f46 今开, f48 成交额, f170 涨跌幅
+        "fields": "f43,f46,f48,f170,f57,f58",
+    }
+    r = httpx.get(
+        "https://push2.eastmoney.com/api/qt/stock/get",
+        params=params,
+        timeout=8.0,
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+    r.raise_for_status()
+    j = r.json()
+    data = j.get("data") or {}
+    if not data:
+        raise RuntimeError(f"空报价数据: {j!r}")
+    return data
+
+
+def _normalize_price(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    # Eastmoney push2 stock/get fields:
+    # - f43 最新价: int, price * 100
+    # - f46 今开:   int, price * 100
+    # - f170 涨跌幅: int, pct * 100
+    # So for price-like fields coming from push2, we deterministically divide by 100
+    # when the value is integer-like.
+    if isinstance(v, int):
+        return float(v) / 100.0
+    px = float(v)
+    # If it is a float but still looks like scaled cents (rare), apply a safe heuristic.
+    if abs(px) >= 100 and abs(px - round(px)) < 1e-9:
+        return float(px) / 100.0
+    return float(px)
+
+
+def _normalize_pct(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    if isinstance(v, int):
+        return float(v) / 100.0
+    x = float(v)
+    if abs(x) >= 100 and abs(x - round(x)) < 1e-9:
+        return float(x) / 100.0
+    return float(x)
+
+
 def get_realtime_price_with_source(code: str) -> tuple[Optional[float], Optional[float], str]:
     """
     返回 (最新价, 今日累计成交额, 数据源)。
-    - 优先 AkShare 单股 1分钟分时
-    - 失败则用 东方财富 push2his 分钟K 兜底
+    - 直接使用东方财富 push2 实时报价（更适合 10s 刷新）
+    - 如需分钟K回放，走 `fetch_replay_df`
     """
     try:
-        df = _minute_df_akshare_today(code)
-        if "收盘" not in df.columns or "成交额" not in df.columns:
-            raise RuntimeError(f"缺少列: 收盘/成交额; 实际列名={list(df.columns)}")
-        last_close = _to_float(df.iloc[-1].get("收盘"))
-        total_amount = float(df["成交额"].fillna(0).sum())
-        return last_close, total_amount, "AkShare"
+        q = _eastmoney_quote(code)
+        price = _normalize_price(q.get("f43"))
+        amount = _to_float(q.get("f48"))
+        return price, amount, "东方财富(实时报价)"
     except Exception as e:
         now = datetime.now().strftime("%H:%M:%S")
-        print(colored(f"[{now}] 实时数据源 AkShare 失败，切换东方财富兜底：{type(e).__name__}: {e}", "yellow"))
-
-    try:
-        df2, actual_date = _minute_df_eastmoney_today(code)
-        if "收盘" not in df2.columns or "成交额" not in df2.columns:
-            raise RuntimeError(f"缺少列: 收盘/成交额; 实际列名={list(df2.columns)}")
-        last_close = _to_float(df2.iloc[-1].get("收盘"))
-        total_amount = float(df2["成交额"].fillna(0).sum())
-        src = "东方财富"
-        if actual_date and actual_date != datetime.now().strftime("%Y-%m-%d"):
-            src += f"(返回日期={actual_date})"
-        return last_close, total_amount, src
-    except Exception as e:
-        now = datetime.now().strftime("%H:%M:%S")
-        print(colored(f"[{now}] 东方财富兜底也失败：{type(e).__name__}: {e}", "yellow"))
+        print(colored(f"[{now}] 东方财富实时报价失败：{type(e).__name__}: {e}", "yellow"))
         return None, None, "N/A"
 
 
 def get_realtime_price(code: str) -> tuple[Optional[float], Optional[float]]:
     """
     返回 (最新价, 今日累计成交额).
-
-    使用单股接口：东方财富-每日分时 (1 分钟) `ak.stock_zh_a_hist_min_em`，
-    取最后一根 K 的收盘价作为“当前价”，并把当日所有分钟的成交额求和作为“累计成交额”。
-    这比拉取全市场快照稳定得多。
+    兼容旧接口：现在等价于 `get_realtime_price_with_source` 的前两项（东方财富实时报价）。
     """
-    now = datetime.now()
-    start = now.strftime("%Y-%m-%d 09:30:00")
-    end = now.strftime("%Y-%m-%d %H:%M:%S")
-
-    df = call_with_retries(
-        "拉取单股分时行情",
-        ak.stock_zh_a_hist_min_em,
-        kwargs={
-            "symbol": str(code),
-            "start_date": start,
-            "end_date": end,
-            "period": "1",
-            "adjust": "",
-        },
-        max_retries=3,
-    )
-
-    if df is None or len(df) == 0:
-        return None, None
-
-    if "收盘" not in df.columns or "成交额" not in df.columns:
-        raise RuntimeError(f"缺少列: 收盘/成交额; 实际列名={list(df.columns)}")
-
-    last_close = _to_float(df.iloc[-1].get("收盘"))
-    # 今日累计成交额（元）
-    amt_series = df["成交额"]
-    total_amount = float(amt_series.fillna(0).sum())
-    return last_close, total_amount
+    px, amt, _ = get_realtime_price_with_source(code)
+    return px, amt
 
 
 def get_today_open_price(code: str) -> Optional[float]:
     """
     交易时段基准价：当日开盘价。
-    用单股 1分钟分时取第一根的开盘价作为“开盘价”。
+    优先用东方财富实时报价里的“今开 f46”；缺失则退化为分钟K第一根开盘价。
     """
-    now = datetime.now()
-    start = now.strftime("%Y-%m-%d 09:30:00")
-    end = now.strftime("%Y-%m-%d %H:%M:%S")
-    df = call_with_retries(
-        "拉取当日开盘价",
-        ak.stock_zh_a_hist_min_em,
-        kwargs={
-            "symbol": str(code),
-            "start_date": start,
-            "end_date": end,
-            "period": "1",
-            "adjust": "",
-        },
-        max_retries=2,
-        base_delay=1.0,
-        max_delay=6.0,
-    )
+    try:
+        q = _eastmoney_quote(code)
+        op = _normalize_price(q.get("f46"))
+        if op is not None and op > 0:
+            return float(op)
+    except Exception:
+        pass
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    df, _actual = _fetch_minute_df_eastmoney(code, today)
     if df is None or len(df) == 0:
-        return None
-    if "开盘" not in df.columns:
         return None
     return _to_float(df.iloc[0].get("开盘"))
 
@@ -522,6 +445,7 @@ def main() -> None:
     ap.add_argument("--ignore-trading-hours", action="store_true", help="忽略交易时段限制（方便测试）")
     ap.add_argument("--alert-cooldown", type=int, default=60, help="触发信号弹窗冷却秒数，默认 60")
     ap.add_argument("--position-cash", type=float, default=10000.0, help="每次买入投入金额（元），默认 10000")
+    ap.add_argument("--buy-remind-seconds", type=int, default=300, help="买入预警点了“不买”后，隔多少秒再次提醒（默认 300）")
     args = ap.parse_args()
 
     symbol = args.symbol
@@ -553,8 +477,8 @@ def main() -> None:
     last_alert_at: float = 0.0
     last_signal: Optional[str] = None  # BUY/SELL/None
     next_replay_init_at: float = 0.0
-    defer_buy_prompt: bool = False
-    defer_sell_prompt: bool = False
+    next_buy_prompt_at: float = 0.0
+    # 只保留“是否买入”的交互弹窗，不做“是否卖出”弹窗
 
     while True:
         loops += 1
@@ -623,16 +547,13 @@ def main() -> None:
                     else:
                         print(status + " | 监控中...")
 
-                    # 避免“拒绝后每次循环都弹窗”：只有信号消失后才允许再次弹窗
+                    # 买入二次提醒：信号消失则立刻允许下次出现时再弹
                     if signal != "BUY":
-                        defer_buy_prompt = False
-                    if signal != "SELL":
-                        defer_sell_prompt = False
+                        next_buy_prompt_at = 0.0
 
                     # 交互式决策：买 / 不买
-                    if signal == "BUY" and (not in_position) and (not defer_buy_prompt):
+                    if signal == "BUY" and (not in_position) and (time.time() >= next_buy_prompt_at):
                         ok = prompt_choice("买入决策", status + "\n\n是否执行买入？", yes_text="买入", no_text="不买", default_yes=False)
-                        defer_buy_prompt = True
                         if ok:
                             lot_cost = float(current_price) * float(tcfg.lot_size)
                             shares = int((tcfg.position_cash // lot_cost) * tcfg.lot_size) if lot_cost > 0 else 0
@@ -646,6 +567,7 @@ def main() -> None:
                                 buy_shares = shares
                                 buy_amount = float(shares) * float(current_price)
                                 buy_fee = calculate_fee(tcfg, buy_amount, is_selling=False)
+                                next_buy_prompt_at = 0.0
                                 print(
                                     colored(
                                         f"[{tstr}] 已买入(模拟)：买入价 {buy_price:.3f} | 股数 {buy_shares} | 买入额 {buy_amount:.2f} | 买入费用 {buy_fee:.2f}",
@@ -654,38 +576,11 @@ def main() -> None:
                                     )
                                 )
                         else:
-                            print(colored(f"[{tstr}] 选择不买，继续观察。", "yellow"))
+                            next_buy_prompt_at = time.time() + float(args.buy_remind_seconds)
+                            nxt = datetime.fromtimestamp(next_buy_prompt_at).strftime("%H:%M:%S")
+                            print(colored(f"[{tstr}] 选择不买，继续观察。将在 {nxt} 后再次提醒是否买入。", "yellow"))
 
-                    # 交互式决策：卖 / 不卖
-                    if signal == "SELL" and in_position and (not defer_sell_prompt):
-                        ok = prompt_choice("卖出决策", status + "\n\n是否执行卖出？", yes_text="卖出", no_text="不卖", default_yes=False)
-                        defer_sell_prompt = True
-                        if ok:
-                            sell_amount = float(buy_shares) * float(current_price)
-                            sell_fee = calculate_fee(tcfg, sell_amount, is_selling=True)
-                            profit = sell_amount - buy_amount - buy_fee - sell_fee
-                            print(
-                                colored(
-                                    f"[{tstr}] 已卖出(模拟)结算：卖出额 {sell_amount:.2f} | 卖出费用 {sell_fee:.2f} | 本次盈亏(含费用) {profit:+.2f}元",
-                                    "green",
-                                    attrs=["bold"],
-                                )
-                            )
-                            in_position = False
-                            buy_price = None
-                            buy_mode = None
-                            buy_time = None
-                            buy_shares = 0
-                            buy_amount = 0.0
-                            buy_fee = 0.0
-                        else:
-                            print(colored(f"[{tstr}] 选择不卖，继续持有观察。", "yellow"))
-
-                    # 3) 触发警戒线弹窗（带冷却 + 同信号不重复刷屏）
-                    if signal and (time.time() - last_alert_at >= int(args.alert_cooldown) or signal != last_signal):
-                        show_alert("防范补跌风险" if signal == "BUY" else "止盈提醒", status)
-                        last_alert_at = time.time()
-                        last_signal = signal
+                    # 说明：已按需求移除所有“卖出/止盈”弹窗，仅保留买入决策弹窗
                 else:
                     print(f"[{now.strftime('%H:%M:%S')}] 回放数据推进失败，等待下次…")
 
@@ -754,13 +649,10 @@ def main() -> None:
                     print(status + " | 监控中...")
 
                 if signal != "BUY":
-                    defer_buy_prompt = False
-                if signal != "SELL":
-                    defer_sell_prompt = False
+                    next_buy_prompt_at = 0.0
 
-                if signal == "BUY" and (not in_position) and (not defer_buy_prompt):
+                if signal == "BUY" and (not in_position) and (time.time() >= next_buy_prompt_at):
                     ok = prompt_choice("买入决策", status + "\n\n是否执行买入？", yes_text="买入", no_text="不买", default_yes=False)
-                    defer_buy_prompt = True
                     if ok:
                         lot_cost = float(current_price) * float(tcfg.lot_size)
                         shares = int((tcfg.position_cash // lot_cost) * tcfg.lot_size) if lot_cost > 0 else 0
@@ -774,6 +666,7 @@ def main() -> None:
                             buy_shares = shares
                             buy_amount = float(shares) * float(current_price)
                             buy_fee = calculate_fee(tcfg, buy_amount, is_selling=False)
+                            next_buy_prompt_at = 0.0
                             print(
                                 colored(
                                     f"[{buy_time}] 已买入(模拟)：买入价 {buy_price:.3f} | 股数 {buy_shares} | 买入额 {buy_amount:.2f} | 买入费用 {buy_fee:.2f}",
@@ -782,36 +675,11 @@ def main() -> None:
                                 )
                             )
                     else:
-                        print(colored(f"[{now.strftime('%H:%M:%S')}] 选择不买，继续观察。", "yellow"))
+                        next_buy_prompt_at = time.time() + float(args.buy_remind_seconds)
+                        nxt = datetime.fromtimestamp(next_buy_prompt_at).strftime("%H:%M:%S")
+                        print(colored(f"[{now.strftime('%H:%M:%S')}] 选择不买，继续观察。将在 {nxt} 后再次提醒是否买入。", "yellow"))
 
-                if signal == "SELL" and in_position and (not defer_sell_prompt):
-                    ok = prompt_choice("卖出决策", status + "\n\n是否执行卖出？", yes_text="卖出", no_text="不卖", default_yes=False)
-                    defer_sell_prompt = True
-                    if ok:
-                        sell_amount = float(buy_shares) * float(current_price)
-                        sell_fee = calculate_fee(tcfg, sell_amount, is_selling=True)
-                        profit = sell_amount - buy_amount - buy_fee - sell_fee
-                        print(
-                            colored(
-                                f"[{now.strftime('%H:%M:%S')}] 已卖出(模拟)结算：卖出额 {sell_amount:.2f} | 卖出费用 {sell_fee:.2f} | 本次盈亏(含费用) {profit:+.2f}元",
-                                "green",
-                                attrs=["bold"],
-                            )
-                        )
-                        in_position = False
-                        buy_price = None
-                        buy_mode = None
-                        buy_time = None
-                        buy_shares = 0
-                        buy_amount = 0.0
-                        buy_fee = 0.0
-                    else:
-                        print(colored(f"[{now.strftime('%H:%M:%S')}] 选择不卖，继续持有观察。", "yellow"))
-
-                if signal and (time.time() - last_alert_at >= int(args.alert_cooldown) or signal != last_signal):
-                    show_alert("防范补跌风险" if signal == "BUY" else "止盈提醒", status)
-                    last_alert_at = time.time()
-                    last_signal = signal
+                # 说明：已按需求移除所有“卖出/止盈”弹窗，仅保留买入决策弹窗
 
         if args.max_loops and loops >= args.max_loops:
             print(f"达到 max_loops={args.max_loops}，测试结束。")

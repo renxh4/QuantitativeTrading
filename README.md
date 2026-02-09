@@ -101,24 +101,9 @@ python scripts/efinance_a_share_realtime.py
 python scripts/efinance_a_share_realtime.py --once
 ```
 
-### 使用 AkShare 监控「有色金属」板块（板块平均跌幅触发弹窗）
+### 行业板块监控说明
 
-脚本：`scripts/akshare_nonferrous_monitor.py`
-
-逻辑：
-
-- 拉取行业板块「有色金属」的成分股列表
-- 获取成分股实时涨跌幅，计算板块**平均涨跌幅**
-- 若 **板块平均涨跌幅 <= -3%** 且 **铜陵有色(000630)跌幅小于 2%**（即涨跌幅 > -2%）
-  则弹窗提醒：**“防范补跌风险”**
-
-运行（默认每 20 秒刷新一次，可改成 60 秒）：
-
-```bash
-source .venv/bin/activate
-pip install -r requirements.txt
-python scripts/akshare_nonferrous_monitor.py --refresh 60
-```
+此前提供过基于 AkShare 的板块监控脚本；由于你反馈 AkShare 数据源不稳定，**已从项目中移除 AkShare 依赖及相关脚本**。
 
 ### 使用 Baostock 做T监控（分钟K轮询 + 彩色报警）
 
